@@ -1,0 +1,193 @@
+name: Create
+
+on:
+  workflow_dispatch:
+env:
+  PORT: 6550
+  USERNAME: ec2-user
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: hashicorp/setup-terraform@v2
+      - name: Extract branch name
+        shell: bash
+        run: echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
+        id: extract_branch
+      - uses: actions/cache@v3
+        with:
+          path: |
+            .terraform/**
+            .terraform.lock.hcl
+            plan.cache
+          key: terraform-lock-${{ github.event.workflow_run.head_branch }}
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+          
+      - name: Terraform plan Persistent
+        id: plan_persistent
+        run: |
+          cd ./persistent
+          terraform init
+          terraform plan -no-color -out plan_cache.json 
+
+      - name: Terraform apply Persistent
+        run: |
+          cd ./persistent
+          terraform apply -input=false -no-color -auto-approve plan_cache.json
+
+      - name: Terraform plan Disposable
+        id: plan_disposable
+        run: |
+          cd ./disposable
+          terraform init
+          terraform plan -no-color -out plan_cache.json 
+
+      - name: Terraform apply Disposable
+        run: |
+          cd ./disposable
+          terraform apply -input=false -no-color -auto-approve plan_cache.json       
+
+  kubeconfig:
+    runs-on: ubuntu-latest
+    needs: apply
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v3
+      - uses: hashicorp/setup-terraform@v2
+      - name: Write secret to file
+        run: |
+          echo "${{ secrets.KEYPAIR }}" > cert.pem
+          chmod 600 cert.pem
+          
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Waiting for cluster to be ready
+        run: |
+          HOST=`aws ec2 describe-instances --filters 'Name=tag:Name,Values=cluster-demo-install'   --output text --query 'Reservations[*].Instances[*].PublicIpAddress'`
+          while ! nc -z $HOST $PORT; do
+            echo "waiting for cluster to be ready..."
+            sleep 2
+          done
+          echo "Cluster Ready!"
+          echo "Host=$HOST" >> $GITHUB_ENV
+
+      - name: Generate kube config with k3d
+        run: |
+           ssh -i ./cert.pem -o StrictHostKeyChecking=no $USERNAME@${{  env.Host }} "mkdir -p .kube && k3d kubeconfig get k3s > ~/.kube/config"
+ 
+      - name: Download kube config
+        run: |
+           mkdir -p ~/.kube
+           scp -i ./cert.pem -o StrictHostKeyChecking=no $USERNAME@${{ env.Host }}:~/.kube/config ~/.kube/config
+ 
+      - name: Print downloaded config
+        run: |  
+          CERTIFICATE=`cat  ~/.kube/config |grep certificate-authority-data `
+          sed -i "s|$CERTIFICATE|    insecure-skip-tls-verify: true|g" ~/.kube/config
+          sed -i "s|0.0.0.0|${{ env.Host }}|g" ~/.kube/config
+
+ 
+      - name: Upload kube config
+        uses: actions/upload-artifact@v3
+        with:
+          name: kube-config
+          path: ~/.kube/config
+
+      - name: Write Catalogo Info
+        run: |
+          yq e '.metadata.environment.public_ip = "${{ env.Host }}"' -i .platform/component.yaml
+          yq -e '.metadata.annotations["cluster/instructions"] = "# Run the following commands to import the kubeconfig:
+            ssh -i ./cert.pem -o StrictHostKeyChecking=no $USERNAME@$${{ env.Host }} \"mkdir -p .kube && k3d kubeconfig get k3s > ~/.kube/config\"
+            scp -i ./cert.pem $USERNAME@$${{ env.Host }}:~/.kube/config ~/.kube/config-cluster-demo-install
+            yq -e '\''del(.clusters[0].cluster.certificate-authority-data) | .clusters[0].cluster.insecure-skip-tls-verify=true | .clusters[].cluster.server |= sub(\"0.0.0.0\", \"${{ env.Host }}\")'\'' -i ~/.kube/config-cluster-demo-install
+            export KUBECONFIG=~/.kube/config-cluster-demo-install
+            kubectl get pods -A
+          "' -i .platform/component.yaml
+          cat ./.platform/component.yaml
+
+      - name: Temporarily disable branch protection
+        uses: benjefferies/branch-protection-bot@master
+        if: always()
+        with:
+          access_token: ${{ secrets.API_TOKEN_GITHUB }}
+          branch: ${{ github.event.repository.default_branch }}
+
+      - name: Publish catalog info
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          repository: ".platform/"
+          commit_user_name: veecode-bot
+          commit_user_email: github-admin@vee.codes
+          commit_author: veecode-bot<github-admin@vee.codes>
+          commit_message: "Update catalog-info.yaml with RDS endpoint"
+          push_options: '--force'
+  vkpr-apply:
+    runs-on: ubuntu-latest
+    needs: kubeconfig
+    steps:
+      - uses: actions/checkout@v3
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY}}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY}}
+          aws-region: ${{ secrets.AWS_REGION}}
+          
+      - name: Install Vkpr
+        shell: bash
+        run: |
+          curl -fsSL https://get.vkpr.net/ | CONTROL_SKIP="true" bash
+          rit update repo --name="vkpr-cli" --version=1.3.9
+
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod a+x /usr/local/bin/yq
+          yq --version 
+
+      ### Configure VKPR Credentials
+      - name: config vkpr credentials
+        env:
+          MODE: ""
+        shell: bash
+        run: |
+            rit set credential --provider="aws" \
+                --fields="accesskeyid,region,secretaccesskey" \
+                --values="${{ secrets.AWS_ACCESS_KEY }},${{ secrets.AWS_REGION }},${{ secrets.AWS_SECRET_KEY }}" 
+            if [ '$MODE' != 'dbless' ]; then
+              POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+              if [ -n "$POSTGRES_PASSWORD" ]; then
+                rit set credential --provider="postgres" \
+                --fields="password,service" \
+                --values="${{ secrets.POSTGRES_PASSWORD }},postgres" 
+              fi
+            fi  
+        
+
+    ### Usin k8s context
+      - name: Download kubeconfig artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: kube-config
+          path: ~/.kube
+
+    ### Provisionamento (Prometheus with remote write)
+      - name: Vkpr apply
+        run: |
+          shopt -s expand_aliases
+          alias vkpr="rit vkpr"
+          vkpr apply --path_to_file="$(pwd)/vkpr.yaml"
+
+      

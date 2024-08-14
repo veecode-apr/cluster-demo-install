@@ -1,0 +1,8 @@
+global:
+  domain: ec2.enviroment.platform.vee.codes
+
+  provider: aws
+  ingressClassName: nginx
+nginx:
+  enabled: true
+
